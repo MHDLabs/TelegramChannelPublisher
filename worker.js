@@ -1,21 +1,12 @@
 const STATES = {
   IDLE: "idle",
-  WAITING_MEDIA: "waiting_media",
-  WAITING_CAPTION: "waiting_caption",
-  WAITING_NEW_CAPTION: "waiting_new_caption",
-  WAITING_CONFIRM: "waiting_confirm",
-  WAITING_SCHEDULE: "waiting_schedule",
-  WAITING_CHANNEL: "waiting_channel",
   WAITING_CHANNEL_FORWARD: "waiting_channel_forward",
   WAITING_DELETE_CHANNEL: "waiting_delete_channel",
-  WAITING_PREVIEW: "waiting_preview",
   WAITING_SIGNATURE: "waiting_signature",
   WAITING_BAN_USER: "waiting_ban_user",
   WAITING_UNBAN_USER: "waiting_unban_user",
   WAITING_BROADCAST: "waiting_broadcast",
-  WAITING_GLOBAL_POST: "waiting_global_post",
-  WAITING_GLOBAL_CAPTION: "waiting_global_caption",
-  WAITING_GLOBAL_PREVIEW: "waiting_global_preview"
+  WAITING_GLOBAL_POST: "waiting_global_post"
 };
 
 const TG_API = "https://api.telegram.org/bot";
@@ -53,13 +44,14 @@ async function tgRequest(method, payload, env) {
   }
 }
 
-async function sendMessage(chatId, text, replyMarkup, env) {
+async function sendMessage(chatId, text, replyMarkup, env, replyToMessageId) {
   const payload = { chat_id: chatId, text: text };
   if (replyMarkup) payload.reply_markup = replyMarkup;
+  if (replyToMessageId) payload.reply_to_message_id = replyToMessageId;
   return tgRequest("sendMessage", payload, env);
 }
 
-async function sendMedia(chatId, mediaType, fileId, caption, replyMarkup, env) {
+async function sendMedia(chatId, mediaType, fileId, caption, replyMarkup, env, replyToMessageId) {
   const methodMap = {
     photo: "sendPhoto", video: "sendVideo", document: "sendDocument",
     audio: "sendAudio", voice: "sendVoice", animation: "sendAnimation"
@@ -70,6 +62,7 @@ async function sendMedia(chatId, mediaType, fileId, caption, replyMarkup, env) {
   const payload = { chat_id: chatId };
   if (caption) payload.caption = caption;
   if (replyMarkup) payload.reply_markup = replyMarkup;
+  if (replyToMessageId) payload.reply_to_message_id = replyToMessageId;
 
   if (method === "sendPhoto") payload.photo = fileId;
   else if (method === "sendVideo") payload.video = fileId;
@@ -79,6 +72,17 @@ async function sendMedia(chatId, mediaType, fileId, caption, replyMarkup, env) {
   else if (method === "sendAnimation") payload.animation = fileId;
 
   return tgRequest(method, payload, env);
+}
+
+async function sendMediaGroup(chatId, files, caption, env, replyToMessageId) {
+  const media = files.map((f, index) => {
+    const item = { type: f.type, media: f.file_id };
+    if (index === 0 && caption) item.caption = caption;
+    return item;
+  });
+  const payload = { chat_id: chatId, media: media };
+  if (replyToMessageId) payload.reply_to_message_id = replyToMessageId;
+  return tgRequest("sendMediaGroup", payload, env);
 }
 
 async function editMessageCaption(chatId, messageId, caption, replyMarkup, env) {
@@ -129,6 +133,23 @@ async function ensureDb(env) {
                          env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id)")
       ]);
     }
+
+    const userCols = await dbAll(env, "PRAGMA table_info(users)");
+    const userColNames = userCols.map(c => c.name);
+    if (!userColNames.includes("caption_mode")) await dbRun(env, "ALTER TABLE users ADD COLUMN caption_mode TEXT DEFAULT 'auto'");
+    if (!userColNames.includes("hashtag_mode")) await dbRun(env, "ALTER TABLE users ADD COLUMN hashtag_mode TEXT DEFAULT 'manual'");
+
+    const draftCols = await dbAll(env, "PRAGMA table_info(drafts)");
+    const draftColNames = draftCols.map(c => c.name);
+    if (!draftColNames.includes("original_message_id")) await dbRun(env, "ALTER TABLE drafts ADD COLUMN original_message_id TEXT");
+    if (!draftColNames.includes("preview_message_id")) await dbRun(env, "ALTER TABLE drafts ADD COLUMN preview_message_id TEXT");
+    if (!draftColNames.includes("media_group_id")) await dbRun(env, "ALTER TABLE drafts ADD COLUMN media_group_id TEXT");
+    if (!draftColNames.includes("is_global")) await dbRun(env, "ALTER TABLE drafts ADD COLUMN is_global INTEGER DEFAULT 0");
+
+    await dbRun(env, "CREATE INDEX IF NOT EXISTS idx_drafts_orig_msg ON drafts(original_message_id)");
+    await dbRun(env, "CREATE INDEX IF NOT EXISTS idx_drafts_prev_msg ON drafts(preview_message_id)");
+    await dbRun(env, "CREATE INDEX IF NOT EXISTS idx_drafts_media_group ON drafts(media_group_id)");
+
   } catch (e) {
     console.error("DB init error", e);
     throw new Error("Database initialization failed");
@@ -148,18 +169,18 @@ async function updateUserState(env, id, state) {
 }
 
 function parseDraftMessage(msgStr) {
-  if (!msgStr) return {};
+  if (!msgStr) return { files: [], is_album: false, is_text_only: true };
   try {
     if (msgStr.startsWith("{")) return JSON.parse(msgStr);
-  } catch(e) {}
-  return { file_id: msgStr };
+  } catch (e) { }
+  return { files: [{ type: 'photo', file_id: msgStr }], is_album: false, is_text_only: false };
 }
 
 function getMainKeyboard(role) {
   const keyboard = [
     [{ text: "➕ پست جدید" }, { text: "📡 کانال‌های من" }],
     [{ text: "➕ افزودن کانال" }, { text: "🗑 حذف کانال" }],
-    [{ text: "✍️ امضا" }, { text: "📊 آمار" }]
+    [{ text: "✍️ امضا" }, { text: "📊 آمار" }, { text: "⚙️ تنظیمات" }]
   ];
   if (role === "owner") {
     keyboard.push([{ text: "👑 کاربران" }, { text: "📈 آمار کل" }]);
@@ -173,7 +194,7 @@ function getPreviewKeyboard(hasHashtags, isGlobal, draftId) {
   const buttons = [];
   if (isGlobal) {
     buttons.push([
-      { text: "🚀 انتشار", callback_data: `gpub_${draftId}` },
+      { text: "🚀 انتشار سراسری", callback_data: `gpub_${draftId}` },
       { text: "✏️ ویرایش کپشن", callback_data: `gedit_${draftId}` }
     ]);
     buttons.push([{ text: "❌ لغو", callback_data: `gcancel_${draftId}` }]);
@@ -193,6 +214,27 @@ function getPreviewKeyboard(hasHashtags, isGlobal, draftId) {
     buttons.push([{ text: "❌ لغو", callback_data: `cancel_${draftId}` }]);
   }
   return { inline_keyboard: buttons };
+}
+
+function cleanCaption(text) {
+  if (!text) return "";
+  text = text.replace(/#[\w\u0600-\u06FF]+/g, "");
+  text = text.replace(/@[\w\u0600-\u06FF]+/g, "");
+  text = text.replace(/https?:\/\/(t\.me|telegram\.me|telegram\.dog)\/[^\s]+/gi, "");
+  text = text.replace(/(^|\s)(t\.me|telegram\.me|telegram\.dog)\/[^\s]+/gi, "$1");
+  text = text.replace(/[ \t]+/g, " ");
+  text = text.replace(/\n{3,}/g, "\n\n");
+  return text.trim();
+}
+
+function cleanTextForHashtags(text) {
+  if (!text) return "";
+  text = text.replace(/https?:\/\/[^\s]+/gi, "");
+  text = text.replace(/(^|\s)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\/[^\s]*/g, "$1");
+  text = text.replace(/@[\w\u0600-\u06FF]+/g, "");
+  text = text.replace(/#[\w\u0600-\u06FF]+/g, "");
+  text = text.replace(/^\s*[\r\n]/gm, "");
+  return text.trim();
 }
 
 async function generateHashtags(text, env) {
@@ -232,24 +274,47 @@ function composeCaption(caption, hashtags, signature, signatureEnabled) {
 async function sendPreview(env, user, draft, isGlobal) {
   const finalCaption = composeCaption(draft.caption, draft.hashtags, user.signature, user.signature_enabled);
   const keyboard = getPreviewKeyboard(!!draft.hashtags, isGlobal, draft.id);
-  const res = await sendMedia(user.id, draft.media_type, draft.file_id, finalCaption, keyboard, env);
+  const msgData = parseDraftMessage(draft.message);
+
+  let res;
+  if (msgData.is_album) {
+    const text = `🖼 آلبوم دریافت شد (${msgData.files.length} فایل).\n\n${finalCaption}`;
+    res = await sendMessage(user.id, text, keyboard, env, draft.original_message_id);
+  } else if (msgData.is_text_only || msgData.files.length === 0) {
+    res = await sendMessage(user.id, finalCaption || "بدون متن", keyboard, env, draft.original_message_id);
+  } else {
+    const file = msgData.files[0];
+    res = await sendMedia(user.id, file.type, file.file_id, finalCaption, keyboard, env, draft.original_message_id);
+  }
 
   if (res && res.ok) {
-    const newMsgData = { file_id: draft.file_id, preview_id: res.result.message_id };
-    await dbRun(env, "UPDATE drafts SET message = ? WHERE id = ?", [JSON.stringify(newMsgData), draft.id]);
-    await updateUserState(env, user.id, isGlobal ? STATES.WAITING_GLOBAL_PREVIEW : STATES.WAITING_PREVIEW);
+    msgData.preview_id = res.result.message_id;
+    await dbRun(env, "UPDATE drafts SET message = ?, preview_message_id = ? WHERE id = ?", [JSON.stringify(msgData), res.result.message_id, draft.id]);
     return true;
   } else {
-    await sendMessage(user.id, "❌ خطا در ارسال پیش‌نمایش. لطفاً دوباره تلاش کنید.", getMainKeyboard(user.role), env);
-    await updateUserState(env, user.id, STATES.IDLE);
+    await sendMessage(user.id, "❌ خطا در ارسال پیش‌نمایش.", getMainKeyboard(user.role), env);
     return false;
   }
 }
 
-async function editPreviewMessage(env, user, draft, messageId, isGlobal) {
+async function editPreviewMessage(env, user, draft, isGlobal) {
   const finalCaption = composeCaption(draft.caption, draft.hashtags, user.signature, user.signature_enabled);
   const keyboard = getPreviewKeyboard(!!draft.hashtags, isGlobal, draft.id);
-  return await editMessageCaption(user.id, messageId, finalCaption, keyboard, env);
+  const msgData = parseDraftMessage(draft.message);
+
+  if (!msgData.preview_id) return await sendPreview(env, user, draft, isGlobal);
+
+  try {
+    if (msgData.is_album || msgData.is_text_only || msgData.files.length === 0) {
+      const text = msgData.is_album ? `🖼 آلبوم دریافت شد (${msgData.files.length} فایل).\n\n${finalCaption}` : (finalCaption || "بدون متن");
+      return await tgRequest("editMessageText", { chat_id: user.id, message_id: msgData.preview_id, text: text, reply_markup: keyboard }, env);
+    } else {
+      return await editMessageCaption(user.id, msgData.preview_id, finalCaption, keyboard, env);
+    }
+  } catch (e) {
+    console.error("Edit preview error", e);
+    return await sendPreview(env, user, draft, isGlobal);
+  }
 }
 
 function getMediaType(msg) {
@@ -264,33 +329,39 @@ function getMediaType(msg) {
 
 function getFileId(msg, type) {
   if (type === "photo") return msg.photo[msg.photo.length - 1].file_id;
-  return msg[type].file_id;
+  return msg[type] ? msg[type].file_id : null;
 }
 
 async function publishDraft(env, user, draft) {
-  const channels = await dbAll(env, "SELECT * FROM channels WHERE user_id = ? AND is_active = 1", [user.id]);
+  const isGlobal = draft.is_global === 1;
+  const channels = isGlobal ? await dbAll(env, "SELECT * FROM channels WHERE is_active = 1", []) : await dbAll(env, "SELECT * FROM channels WHERE user_id = ? AND is_active = 1", [user.id]);
+
   if (channels.length === 0) {
-    await sendMessage(user.id, "❌ شما هیچ کانال فعالی ندارید.", getMainKeyboard(user.role), env);
+    await sendMessage(user.id, isGlobal ? "❌ هیچ کانال فعالی در سطح کل وجود ندارد." : "❌ شما هیچ کانال فعالی ندارید.", getMainKeyboard(user.role), env);
     await dbRun(env, "UPDATE drafts SET status = 'failed' WHERE id = ?", [draft.id]);
     return;
   }
 
-  const updateRes = await dbRun(env, "UPDATE drafts SET status = 'publishing' WHERE id = ? AND status = 'draft'", [draft.id]);
-  if (updateRes.meta.changes === 0) {
-    await sendMessage(user.id, "⚠️ پیش‌نویس قبلاً پردازش شده است.", getMainKeyboard(user.role), env);
-    return;
-  }
-
+  const msgData = parseDraftMessage(draft.message);
   const finalCaption = composeCaption(draft.caption, draft.hashtags, user.signature, user.signature_enabled);
   let successCount = 0;
   let failCount = 0;
 
   for (const ch of channels) {
     try {
-      const res = await sendMedia(ch.chat_id, draft.media_type, draft.file_id, finalCaption, null, env);
+      let res;
+      if (msgData.is_album) {
+        res = await sendMediaGroup(ch.chat_id, msgData.files, finalCaption, env);
+      } else if (msgData.is_text_only || msgData.files.length === 0) {
+        res = await sendMessage(ch.chat_id, finalCaption || "بدون متن", null, env);
+      } else {
+        const file = msgData.files[0];
+        res = await sendMedia(ch.chat_id, file.type, file.file_id, finalCaption, null, env);
+      }
+
       if (res && res.ok) {
         await dbRun(env, "INSERT INTO posts (user_id, channel_id, draft_id, telegram_message_id, status) VALUES (?, ?, ?, ?, ?)",
-                    [user.id, ch.id, draft.id, res.result.message_id.toString(), "success"]);
+                    [user.id, ch.id, draft.id, (res.result.message_id || "").toString(), "success"]);
         successCount++;
       } else {
         failCount++;
@@ -304,70 +375,38 @@ async function publishDraft(env, user, draft) {
 
   const finalStatus = (successCount > 0) ? 'published' : 'failed';
   await dbRun(env, "UPDATE drafts SET status = ?, published_at = CURRENT_TIMESTAMP WHERE id = ?", [finalStatus, draft.id]);
-  await updateUserState(env, user.id, STATES.IDLE);
 
   let statusMsg = "";
   if (successCount > 0 && failCount === 0) {
-    statusMsg = `✅ با موفقیت منتشر شد!\nتعداد: ${successCount}`;
+    statusMsg = `✅ ${isGlobal ? 'سراسری ' : ''}با موفقیت منتشر شد!\nتعداد: ${successCount}`;
   } else if (successCount > 0 && failCount > 0) {
     statusMsg = `⚠️ انتشار ناقص!\nموفق: ${successCount}\nناموفق: ${failCount}`;
   } else {
     statusMsg = `❌ انتشار ناموفق!\nناموفق: ${failCount}`;
   }
   await sendMessage(user.id, statusMsg, getMainKeyboard(user.role), env);
+
+  if (msgData.preview_id) {
+    await tgRequest("deleteMessage", { chat_id: user.id, message_id: msgData.preview_id }, env);
+  }
 }
 
-async function publishGlobalDraft(env, user, draft) {
-  const channels = await dbAll(env, "SELECT * FROM channels WHERE is_active = 1", []);
-  if (channels.length === 0) {
-    await sendMessage(user.id, "❌ هیچ کانال فعالی در سطح کل وجود ندارد.", getMainKeyboard(user.role), env);
-    await dbRun(env, "UPDATE drafts SET status = 'failed' WHERE id = ?", [draft.id]);
-    return;
-  }
-
-  const updateRes = await dbRun(env, "UPDATE drafts SET status = 'publishing' WHERE id = ? AND status = 'draft'", [draft.id]);
-  if (updateRes.meta.changes === 0) {
-    await sendMessage(user.id, "⚠️ پیش‌نویس قبلاً پردازش شده است.", getMainKeyboard(user.role), env);
-    return;
-  }
-
-  const finalCaption = composeCaption(draft.caption, draft.hashtags, user.signature, user.signature_enabled);
-  let successCount = 0;
-  let failCount = 0;
-
-  for (const ch of channels) {
-    try {
-      const res = await sendMedia(ch.chat_id, draft.media_type, draft.file_id, finalCaption, null, env);
-      if (res && res.ok) {
-        await dbRun(env, "INSERT INTO posts (user_id, channel_id, draft_id, telegram_message_id, status) VALUES (?, ?, ?, ?, ?)",
-                    [user.id, ch.id, draft.id, res.result.message_id.toString(), "success"]);
-        successCount++;
-      } else {
-        failCount++;
-      }
-    } catch (e) {
-      console.error("Global publish error", e);
-      failCount++;
+async function autoGenerateTags(env, user, draft, isGlobal) {
+  try {
+    const cleanText = cleanTextForHashtags(draft.caption);
+    if (!cleanText) return;
+    const tags = await generateHashtags(cleanText, env);
+    if (tags) {
+      await dbRun(env, "UPDATE drafts SET hashtags = ? WHERE id = ?", [tags, draft.id]);
+      draft.hashtags = tags;
+      await editPreviewMessage(env, user, draft, isGlobal);
     }
-    await sleep(50);
+  } catch (e) {
+    console.error("Auto tag gen error", e);
   }
-
-  const finalStatus = (successCount > 0) ? 'published' : 'failed';
-  await dbRun(env, "UPDATE drafts SET status = ?, published_at = CURRENT_TIMESTAMP WHERE id = ?", [finalStatus, draft.id]);
-  await updateUserState(env, user.id, STATES.IDLE);
-
-  let statusMsg = "";
-  if (successCount > 0 && failCount === 0) {
-    statusMsg = `✅ سراسری با موفقیت منتشر شد!\nتعداد: ${successCount}`;
-  } else if (successCount > 0 && failCount > 0) {
-    statusMsg = `⚠️ انتشار سراسری ناقص!\nموفق: ${successCount}\nناموفق: ${failCount}`;
-  } else {
-    statusMsg = `❌ انتشار سراسری ناموفق!\nناموفق: ${failCount}`;
-  }
-  await sendMessage(user.id, statusMsg, getMainKeyboard(user.role), env);
 }
 
-async function handleMessage(update, env) {
+async function handleMessage(update, env, ctx) {
   const msg = update.message;
   if (!msg || !msg.from) return;
   const chatId = msg.from.id.toString();
@@ -385,13 +424,17 @@ async function handleMessage(update, env) {
     return;
   }
 
-  const rawText = msg.text || "";
+  const rawText = msg.text || msg.caption || "";
   const text = rawText.trim();
   const state = user.state;
 
+  if (Math.random() < 0.05) {
+    ctx.waitUntil(dbRun(env, "UPDATE drafts SET status = 'expired' WHERE status = 'draft' AND created_at < datetime('now', '-24 hours')"));
+  }
+
   if (text === "/start") {
     await updateUserState(env, chatId, STATES.IDLE);
-    await sendMessage(chatId, "👋 به ربات انتشار پست خوش آمدید!", getMainKeyboard(user.role), env);
+    await sendMessage(chatId, "👋 به ربات انتشار پست خوش آمدید!\nهر پیامی ارسال کنید به عنوان پست جدید ثبت می‌شود.", getMainKeyboard(user.role), env);
     return;
   }
 
@@ -401,7 +444,7 @@ async function handleMessage(update, env) {
     if (target) {
       await dbRun(env, "UPDATE users SET is_banned = 1 WHERE id = ?", [targetId]);
       await sendMessage(chatId, `✅ کاربر ${targetId} مسدود شد.`, getMainKeyboard(user.role), env);
-      try { await sendMessage(targetId, "🚫 شما مسدود شده‌اید.", null, env); } catch(e) { console.error("Failed to notify banned user", e); }
+      try { await sendMessage(targetId, "🚫 شما مسدود شده‌اید.", null, env); } catch (e) { }
     } else {
       await sendMessage(chatId, "❌ کاربر یافت نشد.", getMainKeyboard(user.role), env);
     }
@@ -411,18 +454,13 @@ async function handleMessage(update, env) {
 
   if (state === STATES.WAITING_BROADCAST && role === "owner") {
     const users = await dbAll(env, "SELECT id FROM users WHERE is_banned = 0", []);
-    let sent = 0;
-    let failed = 0;
+    let sent = 0; let failed = 0;
     for (const u of users) {
       try {
         const res = await sendMessage(u.id, `📢 پیام همگانی:\n\n${rawText}`, null, env);
-        if (res && res.ok) sent++;
-        else failed++;
+        if (res && res.ok) sent++; else failed++;
         await sleep(50);
-      } catch(e) {
-        console.error("Broadcast error", e);
-        failed++;
-      }
+      } catch (e) { failed++; }
     }
     await sendMessage(chatId, `✅ پیام همگانی به ${sent} کاربر ارسال شد. ناموفق: ${failed}`, getMainKeyboard(user.role), env);
     await updateUserState(env, chatId, STATES.IDLE);
@@ -455,32 +493,23 @@ async function handleMessage(update, env) {
         await updateUserState(env, chatId, STATES.IDLE);
         return;
       }
-
-      let isUserAdmin = false;
-      let isBotAdmin = false;
+      let isUserAdmin = false; let isBotAdmin = false;
       try {
         const member = await getChatMember(chat.id, chatId, env);
-        if (member && member.ok && (member.result.status === "administrator" || member.result.status === "creator")) {
-          isUserAdmin = true;
-        }
-      } catch(e) { console.error("getChatMember user error", e); }
-
+        if (member && member.ok && (member.result.status === "administrator" || member.result.status === "creator")) isUserAdmin = true;
+      } catch (e) { }
       try {
         const me = await tgRequest("getMe", {}, env);
         if (me && me.ok) {
           const botMember = await getChatMember(chat.id, me.result.id, env);
-          if (botMember && botMember.ok && (botMember.result.status === "administrator" || botMember.result.status === "creator")) {
-            isBotAdmin = true;
-          }
+          if (botMember && botMember.ok && (botMember.result.status === "administrator" || botMember.result.status === "creator")) isBotAdmin = true;
         }
-      } catch(e) { console.error("getChatMember bot error", e); }
-
+      } catch (e) { }
       if (!isUserAdmin || !isBotAdmin) {
         await sendMessage(chatId, "❌ هم شما و هم ربات باید در کانال ادمین باشید.", getMainKeyboard(user.role), env);
         await updateUserState(env, chatId, STATES.IDLE);
         return;
       }
-
       await dbRun(env, "INSERT INTO channels (user_id, chat_id, title, username) VALUES (?, ?, ?, ?)",
                   [chatId, chat.id.toString(), chat.title || "", chat.username || ""]);
       await sendMessage(chatId, "✅ کانال ثبت شد!", getMainKeyboard(user.role), env);
@@ -505,94 +534,76 @@ async function handleMessage(update, env) {
     return;
   }
 
-  const mediaType = getMediaType(msg);
-  if (state === STATES.WAITING_MEDIA || state === STATES.WAITING_GLOBAL_POST || (state === STATES.IDLE && mediaType)) {
-    if (!mediaType) {
-      await sendMessage(chatId, "❌ لطفاً یک رسانه معتبر ارسال کنید.", getMainKeyboard(user.role), env);
+  if (msg.reply_to_message) {
+    const repliedMsgId = msg.reply_to_message.message_id.toString();
+    let draft = await dbGet(env, "SELECT * FROM drafts WHERE preview_message_id = ? AND user_id = ? AND status = 'draft'", [repliedMsgId, chatId]);
+    if (!draft) {
+      draft = await dbGet(env, "SELECT * FROM drafts WHERE original_message_id = ? AND user_id = ? AND status = 'draft'", [repliedMsgId, chatId]);
+    }
+    if (draft) {
+      const newCaption = user.caption_mode === 'auto' ? cleanCaption(rawText) : rawText;
+      await dbRun(env, "UPDATE drafts SET caption = ? WHERE id = ?", [newCaption, draft.id]);
+      draft.caption = newCaption;
+      await editPreviewMessage(env, user, draft, draft.is_global === 1);
+      await sendMessage(chatId, "✅ کپشن بروزرسانی شد.", null, env);
       return;
     }
-    const fileId = getFileId(msg, mediaType);
-    await dbRun(env, "UPDATE drafts SET status = 'cancelled' WHERE user_id = ? AND status = 'draft'", [chatId]);
-    const insertRes = await dbRun(env, "INSERT INTO drafts (user_id, media_type, message) VALUES (?, ?, ?)", [chatId, mediaType, JSON.stringify({ file_id: fileId })]);
-    const draftId = insertRes.meta.last_row_id;
-    await updateUserState(env, chatId, state === STATES.WAITING_GLOBAL_POST ? STATES.WAITING_GLOBAL_CAPTION : STATES.WAITING_CAPTION);
-    await sendMessage(chatId, "📝 کپشن خود را ارسال کنید یا /skip را بزنید.", null, env);
+  }
+
+  if (text === "➕ پست جدید") {
+    await sendMessage(chatId, "📨 هرگونه متن، عکس، فیلم یا فوروارد را ارسال کنید تا پیش‌نویس آن ساخته شود.", null, env);
     return;
   }
 
-  if (state === STATES.WAITING_CAPTION || state === STATES.WAITING_NEW_CAPTION || state === STATES.WAITING_GLOBAL_CAPTION) {
-    let caption = text === "/skip" ? "" : rawText;
-    const draftRow = await dbGet(env, "SELECT * FROM drafts WHERE user_id = ? AND status = 'draft' ORDER BY id DESC LIMIT 1", [chatId]);
-    if (!draftRow) {
-      await sendMessage(chatId, "❌ پیش‌نویس فعالی وجود ندارد.", getMainKeyboard(user.role), env);
-      await updateUserState(env, chatId, STATES.IDLE);
-      return;
-    }
-    await dbRun(env, "UPDATE drafts SET caption = ?, hashtags = '' WHERE id = ?", [caption, draftRow.id]);
-    const msgData = parseDraftMessage(draftRow.message);
-    const draft = { ...draftRow, file_id: msgData.file_id, caption: caption, hashtags: "" };
-    const isGlobal = state === STATES.WAITING_GLOBAL_CAPTION;
-
-    if (msgData.preview_id && (state === STATES.WAITING_NEW_CAPTION || state === STATES.WAITING_GLOBAL_CAPTION)) {
-      const editRes = await editPreviewMessage(env, user, draft, msgData.preview_id, isGlobal);
-      if (!editRes || !editRes.ok) {
-        await sendPreview(env, user, draft, isGlobal);
-      } else {
-        await updateUserState(env, chatId, isGlobal ? STATES.WAITING_GLOBAL_PREVIEW : STATES.WAITING_PREVIEW);
-      }
-    } else {
-      await sendPreview(env, user, draft, isGlobal);
-    }
+  if (text === "⚙️ تنظیمات") {
+    const settings_keyboard = {
+      inline_keyboard: [
+        [
+          { text: `کپشن: ${user.caption_mode === 'auto' ? '✅ خودکار' : '❌ دستی'}`, callback_data: "set_cap" },
+          { text: `هشتگ: ${user.hashtag_mode === 'auto' ? '✅ خودکار' : '❌ دستی'}`, callback_data: "set_tag" }
+        ]
+      ]
+    };
+    await sendMessage(chatId, "⚙️ تنظیمات ربات:", settings_keyboard, env);
     return;
   }
 
-  if (text === "➕ پست جدید" || text === "🌍 پست سراسری") {
-    if (text === "🌍 پست سراسری" && role !== "owner") return;
-    await dbRun(env, "UPDATE drafts SET status = 'cancelled' WHERE user_id = ? AND status = 'draft'", [chatId]);
-    await updateUserState(env, chatId, text === "🌍 پست سراسری" ? STATES.WAITING_GLOBAL_POST : STATES.WAITING_MEDIA);
-    await sendMessage(chatId, "📸 رسانه خود را ارسال کنید.", null, env);
+  if (text === "🌍 پست سراسری" && role === "owner") {
+    await updateUserState(env, chatId, STATES.WAITING_GLOBAL_POST);
+    await sendMessage(chatId, "🌍 پیام یا رسانه سراسری خود را ارسال کنید.", null, env);
     return;
   }
 
   if (text === "📡 کانال‌های من") {
     const channels = await dbAll(env, "SELECT * FROM channels WHERE user_id = ? AND is_active = 1", [chatId]);
     if (channels.length === 0) {
-      await sendMessage(chatId, "❌ هیچ کانالی وجود ندارد.", getMainKeyboard(user.role), env);
-      return;
+      await sendMessage(chatId, "❌ هیچ کانالی وجود ندارد.", getMainKeyboard(user.role), env); return;
     }
     let msgText = "📡 کانال‌های شما:\n";
-    for (const ch of channels) {
-      msgText += `\n- ${ch.title} (@${ch.username || ch.chat_id})`;
-    }
+    for (const ch of channels) msgText += `\n- ${ch.title} (@${ch.username || ch.chat_id})`;
     await sendMessage(chatId, msgText, getMainKeyboard(user.role), env);
     return;
   }
 
   if (text === "➕ افزودن کانال") {
     await updateUserState(env, chatId, STATES.WAITING_CHANNEL_FORWARD);
-    await sendMessage(chatId, "↪️ پیامی از کانال خود فوروارد کنید.", null, env);
-    return;
+    await sendMessage(chatId, "↪️ پیامی از کانال خود فوروارد کنید.", null, env); return;
   }
 
   if (text === "🗑 حذف کانال") {
     const channels = await dbAll(env, "SELECT * FROM channels WHERE user_id = ? AND is_active = 1", [chatId]);
     if (channels.length === 0) {
-      await sendMessage(chatId, "❌ هیچ کانالی وجود ندارد.", getMainKeyboard(user.role), env);
-      return;
+      await sendMessage(chatId, "❌ هیچ کانالی وجود ندارد.", getMainKeyboard(user.role), env); return;
     }
     let msgText = "🗑 شناسه کانال برای حذف را ارسال کنید:\n";
-    for (const ch of channels) {
-      msgText += `\n${ch.id}: ${ch.title}`;
-    }
+    for (const ch of channels) msgText += `\n${ch.id}: ${ch.title}`;
     await updateUserState(env, chatId, STATES.WAITING_DELETE_CHANNEL);
-    await sendMessage(chatId, msgText, null, env);
-    return;
+    await sendMessage(chatId, msgText, null, env); return;
   }
 
   if (text === "✍️ امضا") {
     await updateUserState(env, chatId, STATES.WAITING_SIGNATURE);
-    await sendMessage(chatId, "✍️ امضای جدید خود را ارسال کنید یا /remove را برای حذف بزنید.", null, env);
-    return;
+    await sendMessage(chatId, "✍️ امضای جدید خود را ارسال کنید یا /remove را برای حذف بزنید.", null, env); return;
   }
 
   if (text === "📊 آمار") {
@@ -607,11 +618,8 @@ async function handleMessage(update, env) {
   if (text === "👑 کاربران" && role === "owner") {
     const users = await dbAll(env, "SELECT id, is_banned FROM users ORDER BY created_at DESC LIMIT 30", []);
     let msgText = "👑 ۳۰ کاربر اخیر:\n";
-    for (const u of users) {
-      msgText += `\n${u.id} ${u.is_banned ? "(مسدود)" : ""}`;
-    }
-    await sendMessage(chatId, msgText, getMainKeyboard(user.role), env);
-    return;
+    for (const u of users) msgText += `\n${u.id} ${u.is_banned ? "(مسدود)" : ""}`;
+    await sendMessage(chatId, msgText, getMainKeyboard(user.role), env); return;
   }
 
   if (text === "📈 آمار کل" && role === "owner") {
@@ -625,17 +633,64 @@ async function handleMessage(update, env) {
 
   if (text === "🚫 مسدود کردن" && role === "owner") {
     await updateUserState(env, chatId, STATES.WAITING_BAN_USER);
-    await sendMessage(chatId, "🚫 شناسه کاربر برای مسدود کردن را ارسال کنید.", null, env);
-    return;
+    await sendMessage(chatId, "🚫 شناسه کاربر برای مسدود کردن را ارسال کنید.", null, env); return;
   }
 
   if (text === "📢 همگانی" && role === "owner") {
     await updateUserState(env, chatId, STATES.WAITING_BROADCAST);
-    await sendMessage(chatId, "📢 متن پیام همگانی را ارسال کنید.", null, env);
+    await sendMessage(chatId, "📢 متن پیام همگانی را ارسال کنید.", null, env); return;
+  }
+
+  if (text.startsWith("/")) {
+    await sendMessage(chatId, "❓ دستور ناشناخته.", getMainKeyboard(user.role), env);
     return;
   }
 
-  await sendMessage(chatId, "❓ دستور ناشناخته.", getMainKeyboard(user.role), env);
+  const isGlobal = (state === STATES.WAITING_GLOBAL_POST && role === "owner");
+  if (isGlobal) await updateUserState(env, chatId, STATES.IDLE);
+
+  const mediaType = getMediaType(msg);
+
+  if (msg.media_group_id) {
+    let draft = await dbGet(env, "SELECT * FROM drafts WHERE media_group_id = ? AND user_id = ? AND status = 'draft'", [msg.media_group_id, chatId]);
+    if (draft) {
+      const msgData = parseDraftMessage(draft.message);
+      msgData.files.push({ type: mediaType, file_id: getFileId(msg, mediaType) });
+      await dbRun(env, "UPDATE drafts SET message = ? WHERE id = ?", [JSON.stringify(msgData), draft.id]);
+      draft.message = JSON.stringify(msgData);
+      await editPreviewMessage(env, user, draft, isGlobal);
+      return;
+    } else {
+      const files = [{ type: mediaType, file_id: getFileId(msg, mediaType) }];
+      const draftCaption = user.caption_mode === 'auto' ? cleanCaption(rawText) : rawText;
+      const insertRes = await dbRun(env, "INSERT INTO drafts (user_id, media_type, message, caption, original_message_id, media_group_id, is_global, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'draft')",
+                                    [chatId, 'album', JSON.stringify({ files: files, is_album: true, is_text_only: false }), draftCaption, msg.message_id.toString(), msg.media_group_id, isGlobal ? 1 : 0]);
+      const draftId = insertRes.meta.last_row_id;
+      const draft = { id: draftId, caption: draftCaption, hashtags: "", message: JSON.stringify({ files, is_album: true, is_text_only: false }), original_message_id: msg.message_id.toString(), is_global: isGlobal ? 1 : 0 };
+      await sendPreview(env, user, draft, isGlobal);
+      if (user.hashtag_mode === 'auto' && draft.caption) {
+        ctx.waitUntil(autoGenerateTags(env, user, draft, isGlobal));
+      }
+      return;
+    }
+  }
+
+  const files = mediaType ? [{ type: mediaType, file_id: getFileId(msg, mediaType) }] : [];
+  const isTextOnly = files.length === 0;
+  const mediaTypeStr = mediaType || 'text';
+  const draftCaption = user.caption_mode === 'auto' ? cleanCaption(rawText) : rawText;
+
+  const insertRes = await dbRun(env, "INSERT INTO drafts (user_id, media_type, message, caption, original_message_id, is_global, status) VALUES (?, ?, ?, ?, ?, ?, 'draft')",
+                                [chatId, mediaTypeStr, JSON.stringify({ files: files, is_album: false, is_text_only: isTextOnly }), draftCaption, msg.message_id.toString(), isGlobal ? 1 : 0]);
+
+  const draftId = insertRes.meta.last_row_id;
+  const draft = { id: draftId, caption: draftCaption, hashtags: "", message: JSON.stringify({ files, is_album: false, is_text_only: isTextOnly }), original_message_id: msg.message_id.toString(), is_global: isGlobal ? 1 : 0 };
+
+  await sendPreview(env, user, draft, isGlobal);
+
+  if (user.hashtag_mode === 'auto' && draft.caption) {
+    ctx.waitUntil(autoGenerateTags(env, user, draft, isGlobal));
+  }
 }
 
 async function handleCallback(update, env) {
@@ -662,6 +717,30 @@ async function handleCallback(update, env) {
     return;
   }
 
+  if (data.startsWith("set_")) {
+    const target = data.split("_")[1];
+    if (target === "cap") {
+      const newMode = user.caption_mode === 'auto' ? 'manual' : 'auto';
+      await dbRun(env, "UPDATE users SET caption_mode = ? WHERE id = ?", [newMode, chatId]);
+      user.caption_mode = newMode;
+    } else if (target === "tag") {
+      const newMode = user.hashtag_mode === 'auto' ? 'manual' : 'auto';
+      await dbRun(env, "UPDATE users SET hashtag_mode = ? WHERE id = ?", [newMode, chatId]);
+      user.hashtag_mode = newMode;
+    }
+    const settings_keyboard = {
+      inline_keyboard: [
+        [
+          { text: `کپشن: ${user.caption_mode === 'auto' ? '✅ خودکار' : '❌ دستی'}`, callback_data: "set_cap" },
+          { text: `هشتگ: ${user.hashtag_mode === 'auto' ? '✅ خودکار' : '❌ دستی'}`, callback_data: "set_tag" }
+        ]
+      ]
+    };
+    await tgRequest("editMessageReplyMarkup", { chat_id: chatId, message_id: cb.message.message_id, reply_markup: settings_keyboard }, env);
+    await answerCallbackQuery(cb.id, "✅ تنظیمات بروزرسانی شد.", env);
+    return;
+  }
+
   const parts = data.split("_");
   const action = parts[0];
   const draftId = parts[1];
@@ -680,24 +759,23 @@ async function handleCallback(update, env) {
   const draftRow = await dbGet(env, "SELECT * FROM drafts WHERE id = ? AND user_id = ?", [draftId, chatId]);
   if (!draftRow || draftRow.status !== 'draft') {
     await answerCallbackQuery(cb.id, "❌ پیش‌نویس یافت نشد یا منقضی شده است.", env);
+    if (cb.message) await tgRequest("deleteMessage", { chat_id: chatId, message_id: cb.message.message_id }, env);
     return;
   }
 
   const msgData = parseDraftMessage(draftRow.message);
-  const draft = { ...draftRow, file_id: msgData.file_id };
+  const draft = { ...draftRow, is_global: draftRow.is_global === 1 };
 
   if (action === "gen" || action === "regen") {
     await answerCallbackQuery(cb.id, "✨ در حال تولید هشتگ...", env);
-    const tags = await generateHashtags(draft.caption || "", env);
-    await dbRun(env, "UPDATE drafts SET hashtags = ? WHERE id = ?", [tags, draft.id]);
-    draft.hashtags = tags;
-    if (msgData.preview_id) {
-      const editRes = await editPreviewMessage(env, user, draft, msgData.preview_id, false);
-      if (!editRes || !editRes.ok) {
-        await sendPreview(env, user, draft, false);
-      }
+    const cleanText = cleanTextForHashtags(draft.caption || "");
+    if (cleanText) {
+      const tags = await generateHashtags(cleanText, env);
+      await dbRun(env, "UPDATE drafts SET hashtags = ? WHERE id = ?", [tags, draft.id]);
+      draft.hashtags = tags;
+      await editPreviewMessage(env, user, draft, draft.is_global);
     } else {
-      await sendPreview(env, user, draft, false);
+      await answerCallbackQuery(cb.id, "❌ متنی برای تولید هشتگ یافت نشد.", env);
     }
     return;
   }
@@ -705,33 +783,26 @@ async function handleCallback(update, env) {
   if (action === "rem") {
     await dbRun(env, "UPDATE drafts SET hashtags = '' WHERE id = ?", [draft.id]);
     draft.hashtags = "";
-    if (msgData.preview_id) {
-      const editRes = await editPreviewMessage(env, user, draft, msgData.preview_id, false);
-      if (!editRes || !editRes.ok) {
-        await sendPreview(env, user, draft, false);
-      }
-    }
+    await editPreviewMessage(env, user, draft, draft.is_global);
     await answerCallbackQuery(cb.id, "✅ هشتگ‌ها حذف شدند.", env);
     return;
   }
 
-  if (action === "edit") {
-    await updateUserState(env, chatId, STATES.WAITING_NEW_CAPTION);
-    await sendMessage(chatId, "📝 کپشن جدید را ارسال کنید.", null, env);
-    await answerCallbackQuery(cb.id, "", env);
-    return;
-  }
-
-  if (action === "gedit") {
-    await updateUserState(env, chatId, STATES.WAITING_GLOBAL_CAPTION);
-    await sendMessage(chatId, "📝 کپشن سراسری جدید را ارسال کنید.", null, env);
+  if (action === "edit" || action === "gedit") {
+    await sendMessage(chatId, "📝 لطفاً کپشن جدید را روی همین پیامِ پیش‌نمایش ریپلای کنید.", null, env);
     await answerCallbackQuery(cb.id, "", env);
     return;
   }
 
   if (action === "cancel" || action === "gcancel") {
-    await dbRun(env, "UPDATE drafts SET status = 'cancelled', deleted_at = CURRENT_TIMESTAMP WHERE id = ?", [draft.id]);
-    await updateUserState(env, chatId, STATES.IDLE);
+    const updateRes = await dbRun(env, "UPDATE drafts SET status = 'cancelled', deleted_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'draft'", [draft.id]);
+    if (updateRes.meta.changes === 0) {
+      await answerCallbackQuery(cb.id, "⚠️ این پست قبلاً لغو شده است.", env);
+      return;
+    }
+    if (cb.message) {
+      await tgRequest("deleteMessage", { chat_id: chatId, message_id: cb.message.message_id }, env);
+    }
     const cancelMsg = action === "gcancel" ? "❌ پست سراسری لغو شد." : "❌ پست لغو شد.";
     await sendMessage(chatId, cancelMsg, getMainKeyboard(user.role), env);
     await answerCallbackQuery(cb.id, "", env);
@@ -740,11 +811,16 @@ async function handleCallback(update, env) {
 
   if (action === "pub" || action === "gpub") {
     await answerCallbackQuery(cb.id, "🚀 در حال انتشار...", env);
-    if (action === "pub") {
-      await publishDraft(env, user, draft);
-    } else {
-      await publishGlobalDraft(env, user, draft);
+    const updateRes = await dbRun(env, "UPDATE drafts SET status = 'publishing' WHERE id = ? AND status = 'draft'", [draftId]);
+    if (updateRes.meta.changes === 0) {
+      await sendMessage(chatId, "⚠️ این پست قبلاً منتشر یا لغو شده است.", getMainKeyboard(user.role), env);
+      if (cb.message) await tgRequest("deleteMessage", { chat_id: chatId, message_id: cb.message.message_id }, env);
+      return;
     }
+    const freshDraft = await dbGet(env, "SELECT * FROM drafts WHERE id = ?", [draftId]);
+    if (!freshDraft) return;
+    draft.is_global = freshDraft.is_global === 1;
+    await publishDraft(env, user, draft);
     return;
   }
 
@@ -766,7 +842,7 @@ export default {
     try {
       await ensureDb(env);
       if (update.message) {
-        await handleMessage(update, env);
+        await handleMessage(update, env, ctx);
       } else if (update.callback_query) {
         await handleCallback(update, env);
       }
