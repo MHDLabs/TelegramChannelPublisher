@@ -14,7 +14,7 @@ Telegram Channel Publisher یک ابزار سبک برای انتشار محتو
 
 ### وضعیت
 
-**v2.0.0 — Stable**
+**v2.0 — Stable**
 
 ---
 
@@ -30,7 +30,7 @@ This is the final stable release before the architectural redesign introduced in
 
 ### Status
 
-**v2.0.0 — Stable**
+**v2.0 — Stable**
 
 ---
 
