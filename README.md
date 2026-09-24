@@ -14,7 +14,7 @@
 
 ### وضعیت
 
-**v1.0.0 — Stable**
+**v1.0 — Stable**
 
 ---
 
@@ -28,7 +28,7 @@ The first stable version of Telegram Channel Publisher, designed with a simple a
 
 ### Status
 
-**v1.0.0 — Stable**
+**v1.0 — Stable**
 
 ---
 
